@@ -9,21 +9,29 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36';
 
-function solveChallenge(sessionToken, challengeText) {
-    const text = challengeText.replace(/\t/g, '').replace(/[^\x20-\x7E]/g, '');
-    const offsetStr = text.split('offset = ')[1].split(';')[0];
-    const offset = parseInt(eval(offsetStr));
-    const encoded = text.split("this, '")[1].split("'")[0];
+function solveChallenge(sessionTokenB64, challengeText) {
+    const text = challengeText.replace(/[^\x20-\x7E]/g, '');
+    const stringMatch = text.match(/'([^']+)'/);
+    if (!stringMatch) throw new Error('Could not extract encoded string');
+    const encoded = stringMatch[1];
+    const offsetMatch = text.match(/var offset\s*=\s*(.+?);/);
+    if (!offsetMatch) throw new Error('Could not extract offset');
+    const offsetExpr = offsetMatch[1].replace(/[^0-9+\-*/() ]/g, '').trim();
+    const offset = Function('"use strict"; return (' + offsetExpr + ')')();
+    const modMatch = text.match(/%\s*(\d+)\)/);
+    const addMatch = text.match(/%\s*\d+\)\s*\+\s*(\d+)\)/);
+    if (!modMatch || !addMatch) throw new Error('Could not extract mod/add');
+    const mod = parseInt(modMatch[1]);
+    const add = parseInt(addMatch[1]);
     let decoded = '';
     for (let i = 0; i < encoded.length; i++) {
-        decoded += String.fromCharCode(((encoded.charCodeAt(i) * i + offset) % 77) + 48);
+        decoded += String.fromCharCode(((encoded.charCodeAt(i) * i + offset) % mod) + add);
     }
-    const decodedToken = Buffer.from(sessionToken, 'base64').toString('utf-8');
+    const decodedToken = Buffer.from(sessionTokenB64, 'base64');
     const sol = [...decoded].map(c => c.charCodeAt(0));
-    const sess = [...decodedToken].map(c => c.charCodeAt(0));
     let result = '';
-    for (let i = 0; i < sess.length; i++) {
-        result += String.fromCharCode(sess[i] ^ sol[i % sol.length]);
+    for (let i = 0; i < decodedToken.length; i++) {
+        result += String.fromCharCode(decodedToken[i] ^ sol[i % sol.length]);
     }
     return result;
 }
@@ -41,11 +49,10 @@ async function getSessionToken(pin) {
 }
 
 class KahootBot {
-    constructor(pin, name, onEvent, botIndex) {
+    constructor(pin, name, onEvent) {
         this.pin = String(pin);
         this.name = name;
         this.onEvent = onEvent;
-        this.botIndex = botIndex;
         this.ws = null;
         this.cid = null;
         this.mid = 0;
@@ -57,54 +64,46 @@ class KahootBot {
     }
 
     async connect() {
-        this.log('getting session token...');
         const { token, challenge } = await getSessionToken(this.pin);
-        this.log('solving challenge...');
         const sessionToken = solveChallenge(token, challenge);
-        this.log('connecting to websocket...');
         return this._connectWs(sessionToken);
     }
 
     _connectWs(sessionToken) {
         return new Promise((resolve, reject) => {
-            const url = `wss://play.kahoot.it/cometd/${this.pin}/${sessionToken}`;
-            this.ws = new WebSocket(url);
-            this.ws.on('open', () => {
-                this.log('ws open, sending handshake...');
-                this._handshake();
+            const url = `wss://kahoot.it/cometd/${this.pin}/${sessionToken}`;
+            this.ws = new WebSocket(url, {
+                headers: {
+                    'Origin': 'https://kahoot.it',
+                    'Cookie': `no.mobitroll.session=${this.pin}`
+                }
             });
+            this.ws.on('open', () => this._handshake());
             this.ws.on('message', (data) => {
                 try {
-                    const raw = data.toString();
-                    const msgs = JSON.parse(raw);
+                    const msgs = JSON.parse(data.toString());
                     const arr = Array.isArray(msgs) ? msgs : [msgs];
                     arr.forEach(m => this._onMsg(m, resolve));
                 } catch (e) {
                     this.log('parse error: ' + e.message);
                 }
             });
-            this.ws.on('error', (e) => {
-                this.log('ws error: ' + e.message);
-                reject(new Error('ws:' + e.message));
-            });
-            this.ws.on('close', (code, reason) => {
-                this.log('ws closed: ' + code + ' ' + reason);
+            this.ws.on('error', (e) => reject(new Error('ws:' + e.message)));
+            this.ws.on('close', (code) => {
                 if (this.ok) this.onEvent('disconnect', {});
                 this.ok = false;
             });
             setTimeout(() => {
-                if (!this.ok) {
-                    this.log('TIMEOUT - never received loginResponse');
-                    this._closeWs();
-                    reject(new Error('timeout'));
-                }
+                if (!this.ok) { this._closeWs(); reject(new Error('timeout')); }
             }, 8000);
         });
     }
 
     _handshake() {
-        this._send('/meta/handshake', {
-            version: '1.0', minimumVersion: '1.0',
+        this._send({
+            channel: '/meta/handshake',
+            version: '1.0',
+            minimumVersion: '1.0',
             supportedConnectionTypes: ['websocket', 'long-polling'],
             advice: { timeout: 60000, interval: 0 },
             ext: { ack: true, timesync: { tc: Date.now(), l: 0, o: 0 } }
@@ -113,56 +112,30 @@ class KahootBot {
 
     _onMsg(m, resolve) {
         const ch = m.channel || '';
-        this.log('RECV ' + ch + ' ' + JSON.stringify(m).substring(0, 300));
 
         if (ch === '/meta/handshake') {
             this.cid = m.clientId;
-            this.log('handshake: clientId=' + (this.cid || 'NONE') + ' successful=' + m.successful);
-            if (!this.cid) {
-                this.log('ERROR: no clientId returned');
-                return;
+            if (!this.cid) return;
+            for (const svc of ['controller', 'player', 'status']) {
+                this._send({ channel: '/meta/subscribe', subscription: `/service/${svc}` });
             }
-            this._send('/meta/subscribe', { subscription: '/service/controller' });
-            this._send('/meta/subscribe', { subscription: '/service/player' });
-            this._send('/meta/subscribe', { subscription: '/service/status' });
-            this._send('/meta/connect', { connectionType: 'websocket', advice: { timeout: 0 } });
+            this._send({ channel: '/meta/connect', connectionType: 'websocket', advice: { timeout: 0 } });
+            return;
         }
 
-        if (ch === '/meta/subscribe') {
-            this.log('subscribe ack: ' + m.subscription + ' successful=' + m.successful + (m.error ? ' error=' + m.error : ''));
-            if (m.successful && (m.subscription || '') === '/service/status') {
-                this.log('all subscriptions done, sending login...');
-                this._send('/service/controller', {
-                    type: 'login',
-                    gameid: parseInt(this.pin),
-                    content: JSON.stringify({ device: { userAgent: UA, screen: { width: 1920, height: 1080 } } }),
-                    name: this.name,
-                    host: 'kahoot.it'
-                });
-            }
-        }
-
-        if (ch === '/meta/connect') {
-            this.log('connect ack: successful=' + m.successful + (m.error ? ' error=' + m.error : ''));
-        }
+        if (ch === '/meta/subscribe') return;
+        if (ch === '/meta/connect') return;
 
         if (ch === '/service/player') {
             const data = m.data || {};
-            this.log('player msg: type=' + data.type + ' id=' + data.id);
+            const id = data.id;
+            let content = {};
+            try { content = JSON.parse(data.content || '{}'); } catch (e) {}
 
-            if (data.type === 'loginResponse') {
-                this.log('LOGIN RESPONSE RECEIVED! content: ' + data.content);
-                this._send('/service/controller', {
-                    id: 16, type: 'message', host: 'kahoot.it', gameid: parseInt(this.pin),
-                    content: JSON.stringify({ usingNamerator: false })
-                });
-                this.ok = true;
-                this.onEvent('joined', {});
-                if (resolve) resolve();
+            if (id === 14) {
+                this.log('connection confirmed: ' + data.content);
             }
 
-            const content = (() => { try { return JSON.parse(data.content || '{}'); } catch (e) { return {}; } })();
-            const id = data.id;
             if (id === 2) {
                 this.answered = false;
                 this.questionIndex = content.questionIndex || 0;
@@ -172,54 +145,57 @@ class KahootBot {
             }
             if (id === 9) this.onEvent('quizstart', content);
             if (id === 3) this.onEvent('gameover', content);
+            if (id === 4) this.onEvent('answerResult', content);
+            if (id === 8) this.onEvent('correctCheck', content);
         }
+    }
 
-        if (ch === '/service/controller') {
-            const data = m.data || {};
-            this.log('controller msg: type=' + data.type + ' id=' + data.id + ' content=' + (data.content || '').substring(0, 200));
-            if (data.type === 'loginResponse' && !this.ok) {
-                this.log('LOGIN RESPONSE (controller)! content: ' + data.content);
-                this._send('/service/controller', {
-                    id: 16, type: 'message', host: 'kahoot.it', gameid: parseInt(this.pin),
-                    content: JSON.stringify({ usingNamerator: false })
-                });
-                this.ok = true;
-                this.onEvent('joined', {});
-                if (resolve) resolve();
+    join() {
+        this._send({
+            channel: '/service/controller',
+            data: {
+                id: 16,
+                type: 'message',
+                gameid: parseInt(this.pin),
+                host: 'kahoot.it',
+                content: JSON.stringify({
+                    name: this.name,
+                    gameMode: 'classic',
+                    policy: 'chat'
+                })
             }
-        }
-
-        if (ch === '/service/status') {
-            const data = m.data || {};
-            this.log('status msg: ' + JSON.stringify(data).substring(0, 100));
-        }
+        });
+        this.ok = true;
+        this.onEvent('joined', {});
     }
 
     sendAnswer(choice) {
         if (this.answered || !this.ok || this.closed) return;
         this.answered = true;
-        this._send('/service/controller', {
-            id: 45, type: 'message', host: 'kahoot.it', gameid: parseInt(this.pin),
-            content: JSON.stringify({
-                type: 'quiz', choice, questionIndex: this.questionIndex,
-                meta: { lag: Math.floor(Math.random() * 200) + 50, device: { userAgent: UA, screen: { width: 1920, height: 1080 } } }
-            })
+        this._send({
+            channel: '/service/controller',
+            data: {
+                id: 6,
+                type: 'message',
+                gameid: parseInt(this.pin),
+                host: 'kahoot.it',
+                content: JSON.stringify({
+                    choice,
+                    meta: {
+                        lag: Math.floor(Math.random() * 200) + 50,
+                        device: { userAgent: UA, screen: { width: 1920, height: 1080 } }
+                    }
+                })
+            }
         });
     }
 
-    _send(ch, data) {
+    _send(msg) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         this.mid++;
-        let msg;
-        if (ch.startsWith('/service/')) {
-            msg = { channel: ch, id: String(this.mid), clientId: this.cid, data: data };
-        } else {
-            msg = { ...data, channel: ch, id: String(this.mid) };
-            if (ch !== '/meta/handshake') msg.clientId = this.cid;
-        }
-        const raw = JSON.stringify([msg]);
-        this.log('SEND ' + ch + ' id=' + msg.id + (data.type ? ' type=' + data.type : '') + (data.subscription ? ' sub=' + data.subscription : ''));
-        this.ws.send(raw);
+        msg.id = String(this.mid);
+        if (msg.channel !== '/meta/handshake') msg.clientId = this.cid;
+        this.ws.send(JSON.stringify([msg]));
     }
 
     _closeWs() { try { if (this.ws) this.ws.close(); } catch (e) {} }
@@ -249,7 +225,6 @@ io.on('connection', (socket) => {
             const name = `${prefix || 'Bot'}${i + 1}`;
             const bot = new KahootBot(pin, name, (ev, d) => {
                 if (ev === 'joined') {
-                    session.bots.push(bot);
                     succ++;
                     socket.emit('botJoin', { name, ok: true });
                 }
@@ -257,8 +232,11 @@ io.on('connection', (socket) => {
                 if (ev === 'quizstart') socket.emit('quizstart', d);
                 if (ev === 'gameover') socket.emit('gameover', d);
                 if (ev === 'disconnect') socket.emit('botDisconnect', { name });
-            }, i);
-            bot.connect().catch((e) => {
+            });
+            bot.connect().then(() => {
+                bot.join();
+                session.bots.push(bot);
+            }).catch((e) => {
                 fail++;
                 socket.emit('botJoin', { name, ok: false, error: e.message });
                 bot.close();
@@ -293,14 +271,14 @@ io.on('connection', (socket) => {
 });
 
 /* ===== serve UI ===== */
-app.get('/health', (req, res) => res.json({ ok: true, version: '1.2.0', uptime: process.uptime() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: '1.3.0', uptime: process.uptime() }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>gefickt v1.2.0</title>
+<title>gefickt v1.3.0</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💀</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -349,7 +327,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
-<div class="ver">v1.2.0</div>
+<div class="ver">v1.3.0</div>
 <div class="app">
 <div class="logo"><h1>kahoot<span>.</span>gefickt</h1></div>
 <div class="field"><label>Game PIN</label><input type="text" id="pin" placeholder="4-10 digits" inputmode="numeric" maxlength="10"></div>
@@ -400,10 +378,10 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&goBtn.style.
 </html>`);
 });
 
-process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); process.exit(0); });
-process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); process.exit(0); });
+process.on('SIGTERM', () => { process.exit(0); });
+process.on('SIGINT', () => { process.exit(0); });
 process.on('uncaughtException', (e) => { console.error('uncaughtException:', e.message); });
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('kahoot-gefickt v1.2.0 on port ' + PORT));
+server.listen(PORT, () => console.log('kahoot-gefickt v1.3.0 on port ' + PORT));
