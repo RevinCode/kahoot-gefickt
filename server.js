@@ -113,6 +113,7 @@ class KahootBot {
 
     _onMsg(m, resolve) {
         const ch = m.channel || '';
+        this.log('RECV ' + ch + ' ' + JSON.stringify(m).substring(0, 300));
 
         if (ch === '/meta/handshake') {
             this.cid = m.clientId;
@@ -133,9 +134,10 @@ class KahootBot {
                 this.log('all subscriptions done, sending login...');
                 this._send('/service/controller', {
                     type: 'login',
-                    gameid: this.pin,
+                    gameid: parseInt(this.pin),
                     content: JSON.stringify({ device: { userAgent: UA, screen: { width: 1920, height: 1080 } } }),
-                    name: this.name
+                    name: this.name,
+                    host: 'kahoot.it'
                 });
             }
         }
@@ -151,7 +153,7 @@ class KahootBot {
             if (data.type === 'loginResponse') {
                 this.log('LOGIN RESPONSE RECEIVED! content: ' + data.content);
                 this._send('/service/controller', {
-                    id: 16, type: 'message', host: 'kahoot.it', gameid: this.pin,
+                    id: 16, type: 'message', host: 'kahoot.it', gameid: parseInt(this.pin),
                     content: JSON.stringify({ usingNamerator: false })
                 });
                 this.ok = true;
@@ -174,7 +176,17 @@ class KahootBot {
 
         if (ch === '/service/controller') {
             const data = m.data || {};
-            this.log('controller msg: type=' + data.type + ' id=' + data.id + ' content=' + (data.content || '').substring(0, 100));
+            this.log('controller msg: type=' + data.type + ' id=' + data.id + ' content=' + (data.content || '').substring(0, 200));
+            if (data.type === 'loginResponse' && !this.ok) {
+                this.log('LOGIN RESPONSE (controller)! content: ' + data.content);
+                this._send('/service/controller', {
+                    id: 16, type: 'message', host: 'kahoot.it', gameid: parseInt(this.pin),
+                    content: JSON.stringify({ usingNamerator: false })
+                });
+                this.ok = true;
+                this.onEvent('joined', {});
+                if (resolve) resolve();
+            }
         }
 
         if (ch === '/service/status') {
@@ -187,7 +199,7 @@ class KahootBot {
         if (this.answered || !this.ok || this.closed) return;
         this.answered = true;
         this._send('/service/controller', {
-            id: 45, type: 'message', gameid: this.pin,
+            id: 45, type: 'message', host: 'kahoot.it', gameid: parseInt(this.pin),
             content: JSON.stringify({
                 type: 'quiz', choice, questionIndex: this.questionIndex,
                 meta: { lag: Math.floor(Math.random() * 200) + 50, device: { userAgent: UA, screen: { width: 1920, height: 1080 } } }
@@ -198,8 +210,13 @@ class KahootBot {
     _send(ch, data) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         this.mid++;
-        const msg = { ...data, channel: ch, id: String(this.mid) };
-        if (ch !== '/meta/handshake') msg.clientId = this.cid;
+        let msg;
+        if (ch.startsWith('/service/')) {
+            msg = { channel: ch, id: String(this.mid), clientId: this.cid, data: data };
+        } else {
+            msg = { ...data, channel: ch, id: String(this.mid) };
+            if (ch !== '/meta/handshake') msg.clientId = this.cid;
+        }
         const raw = JSON.stringify([msg]);
         this.log('SEND ' + ch + ' id=' + msg.id + (data.type ? ' type=' + data.type : '') + (data.subscription ? ' sub=' + data.subscription : ''));
         this.ws.send(raw);
@@ -276,14 +293,14 @@ io.on('connection', (socket) => {
 });
 
 /* ===== serve UI ===== */
-app.get('/health', (req, res) => res.json({ ok: true, version: '1.1.0', uptime: process.uptime() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: '1.2.0', uptime: process.uptime() }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>gefickt v1.1.0</title>
+<title>gefickt v1.2.0</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💀</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -332,7 +349,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
-<div class="ver">v1.1.0</div>
+<div class="ver">v1.2.0</div>
 <div class="app">
 <div class="logo"><h1>kahoot<span>.</span>gefickt</h1></div>
 <div class="field"><label>Game PIN</label><input type="text" id="pin" placeholder="4-10 digits" inputmode="numeric" maxlength="10"></div>
@@ -389,4 +406,4 @@ process.on('uncaughtException', (e) => { console.error('uncaughtException:', e.m
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('kahoot-gefickt v1.1.0 on port ' + PORT));
+server.listen(PORT, () => console.log('kahoot-gefickt v1.2.0 on port ' + PORT));
