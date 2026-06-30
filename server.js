@@ -43,8 +43,9 @@ async function getSessionToken(pin) {
     });
     if (resp.status === 404) throw new Error('Game not found (404)');
     const body = await resp.json();
-    if (!body.challenge) throw new Error('No challenge');
+    if (!body.challenge) throw new Error('No challenge in response');
     const token = resp.headers.get('x-kahoot-session-token');
+    if (!token) throw new Error('No session token header');
     return { token, challenge: body.challenge };
 }
 
@@ -64,38 +65,54 @@ class KahootBot {
     }
 
     async connect() {
+        this.log('getting session token...');
         const { token, challenge } = await getSessionToken(this.pin);
+        this.log('solving challenge...');
         const sessionToken = solveChallenge(token, challenge);
+        this.log('token: ' + sessionToken.substring(0, 30) + '...');
         return this._connectWs(sessionToken);
     }
 
     _connectWs(sessionToken) {
         return new Promise((resolve, reject) => {
             const url = `wss://kahoot.it/cometd/${this.pin}/${sessionToken}`;
-            this.ws = new WebSocket(url, {
-                headers: {
-                    'Origin': 'https://kahoot.it',
-                    'Cookie': `no.mobitroll.session=${this.pin}`
+            this.log('connecting: ' + url.substring(0, 60) + '...');
+            try {
+                this.ws = new WebSocket(url);
+            } catch (e) {
+                this.log('WS CREATE ERROR: ' + e.message);
+                return reject(new Error('ws create: ' + e.message));
+            }
+            const timer = setTimeout(() => {
+                if (!this.ok) {
+                    this.log('TIMEOUT');
+                    this._closeWs();
+                    reject(new Error('timeout'));
                 }
+            }, 8000);
+            this.ws.on('open', () => {
+                this.log('ws open');
+                this._handshake();
             });
-            this.ws.on('open', () => this._handshake());
             this.ws.on('message', (data) => {
                 try {
                     const msgs = JSON.parse(data.toString());
                     const arr = Array.isArray(msgs) ? msgs : [msgs];
-                    arr.forEach(m => this._onMsg(m, resolve));
+                    arr.forEach(m => this._onMsg(m, resolve, timer));
                 } catch (e) {
                     this.log('parse error: ' + e.message);
                 }
             });
-            this.ws.on('error', (e) => reject(new Error('ws:' + e.message)));
-            this.ws.on('close', (code) => {
+            this.ws.on('error', (e) => {
+                this.log('ws error: ' + e.message);
+                clearTimeout(timer);
+                reject(new Error('ws:' + e.message));
+            });
+            this.ws.on('close', (code, reason) => {
+                this.log('ws closed: ' + code);
                 if (this.ok) this.onEvent('disconnect', {});
                 this.ok = false;
             });
-            setTimeout(() => {
-                if (!this.ok) { this._closeWs(); reject(new Error('timeout')); }
-            }, 8000);
         });
     }
 
@@ -110,11 +127,12 @@ class KahootBot {
         });
     }
 
-    _onMsg(m, resolve) {
+    _onMsg(m, resolve, timer) {
         const ch = m.channel || '';
 
         if (ch === '/meta/handshake') {
             this.cid = m.clientId;
+            this.log('handshake ok, cid=' + (this.cid || 'NONE').substring(0, 20));
             if (!this.cid) return;
             for (const svc of ['controller', 'player', 'status']) {
                 this._send({ channel: '/meta/subscribe', subscription: `/service/${svc}` });
@@ -123,7 +141,11 @@ class KahootBot {
             return;
         }
 
-        if (ch === '/meta/subscribe') return;
+        if (ch === '/meta/subscribe') {
+            this.log('sub ' + m.subscription + ': ' + (m.successful ? 'ok' : 'FAIL'));
+            return;
+        }
+
         if (ch === '/meta/connect') return;
 
         if (ch === '/service/player') {
@@ -131,9 +153,14 @@ class KahootBot {
             const id = data.id;
             let content = {};
             try { content = JSON.parse(data.content || '{}'); } catch (e) {}
+            this.log('player id=' + id + ' content=' + JSON.stringify(content).substring(0, 100));
 
             if (id === 14) {
-                this.log('connection confirmed: ' + data.content);
+                this.log('>>> JOINED GAME <<<');
+                this.ok = true;
+                clearTimeout(timer);
+                this.onEvent('joined', {});
+                if (resolve) resolve();
             }
 
             if (id === 2) {
@@ -145,12 +172,15 @@ class KahootBot {
             }
             if (id === 9) this.onEvent('quizstart', content);
             if (id === 3) this.onEvent('gameover', content);
-            if (id === 4) this.onEvent('answerResult', content);
-            if (id === 8) this.onEvent('correctCheck', content);
+        }
+
+        if (ch === '/service/controller') {
+            this.log('controller: ' + JSON.stringify(m).substring(0, 200));
         }
     }
 
     join() {
+        this.log('sending join...');
         this._send({
             channel: '/service/controller',
             data: {
@@ -165,8 +195,6 @@ class KahootBot {
                 })
             }
         });
-        this.ok = true;
-        this.onEvent('joined', {});
     }
 
     sendAnswer(choice) {
@@ -220,12 +248,14 @@ io.on('connection', (socket) => {
         let succ = 0, fail = 0;
 
         console.log(`\n=== FLOOD ${pin} / ${total} bots ===`);
+        socket.emit('log', `flood: ${pin} / ${total} bots`);
 
         for (let i = 0; i < total && session.running; i++) {
             const name = `${prefix || 'Bot'}${i + 1}`;
             const bot = new KahootBot(pin, name, (ev, d) => {
                 if (ev === 'joined') {
                     succ++;
+                    session.bots.push(bot);
                     socket.emit('botJoin', { name, ok: true });
                 }
                 if (ev === 'question') socket.emit('question', d);
@@ -235,16 +265,16 @@ io.on('connection', (socket) => {
             });
             bot.connect().then(() => {
                 bot.join();
-                session.bots.push(bot);
             }).catch((e) => {
                 fail++;
+                console.log(`[${name}] FAILED: ${e.message}`);
                 socket.emit('botJoin', { name, ok: false, error: e.message });
                 bot.close();
             });
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 300));
         }
 
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 10000));
         console.log(`=== DONE: ${succ} ok, ${fail} failed ===\n`);
         socket.emit('ready', { succ, fail });
         session.running = false;
@@ -271,14 +301,14 @@ io.on('connection', (socket) => {
 });
 
 /* ===== serve UI ===== */
-app.get('/health', (req, res) => res.json({ ok: true, version: '1.3.0', uptime: process.uptime() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: '1.3.1', uptime: process.uptime() }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>gefickt v1.3.0</title>
+<title>gefickt v1.3.1</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💀</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -327,7 +357,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
-<div class="ver">v1.3.0</div>
+<div class="ver">v1.3.1</div>
 <div class="app">
 <div class="logo"><h1>kahoot<span>.</span>gefickt</h1></div>
 <div class="field"><label>Game PIN</label><input type="text" id="pin" placeholder="4-10 digits" inputmode="numeric" maxlength="10"></div>
@@ -365,6 +395,7 @@ function updateStatus(){if(connectedCount>0){abStatus.textContent=connectedCount
 goBtn.addEventListener('click',function(){var pin=pinEl.value.trim().replace(/\\s/g,'');var count=parseInt(countEl.value)||10;var prefix=prefixEl.value.trim()||'Bot';if(!pin)return alert('enter a pin');succ=0;fail=0;total=count;connectedCount=0;goBtn.style.display='none';stopBtn.style.display='block';panel.style.display='block';logEl.innerHTML='';botsEl.innerHTML='';addLog('flood: '+pin+' / '+count+' bots','b');socket.emit('start',{pin:pin,count:count,prefix:prefix})});
 stopBtn.addEventListener('click',function(){socket.emit('stop');goBtn.style.display='block';stopBtn.style.display='none';connectedCount=0;updateStatus();addLog('stopped','r')});
 function sendAns(choice){socket.emit('answer',{choice:choice});var n=['RED','BLUE','YELLOW','GREEN'];abLast.textContent=n[choice]+' sent';addLog('sent: '+n[choice],'b');var btns=document.querySelectorAll('.abtn');btns.forEach(function(b,i){b.classList.toggle('sent',i===choice)});setTimeout(function(){btns.forEach(function(b){b.classList.remove('sent')})},400)}
+socket.on('log',function(t){addLog(t,'b')});
 socket.on('botJoin',function(d){if(d.ok){succ++;connectedCount++;addLog('+ '+d.name,'g');addTag(d.name,'g');updateStatus()}else{fail++;addLog('x '+d.name+': '+d.error,'r');addTag(d.name,'r')}updateUI()});
 socket.on('ready',function(d){addLog('done: '+d.succ+' connected, '+d.fail+' failed',d.succ>0?'g':'r')});
 socket.on('question',function(d){addLog('question ('+d.numChoices+' choices)','y')});
@@ -384,4 +415,4 @@ process.on('uncaughtException', (e) => { console.error('uncaughtException:', e.m
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('kahoot-gefickt v1.3.0 on port ' + PORT));
+server.listen(PORT, () => console.log('kahoot-gefickt v1.3.1 on port ' + PORT));
