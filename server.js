@@ -98,7 +98,7 @@ class KahootBot {
                     this._closeWs();
                     reject(new Error('timeout'));
                 }
-            }, 15000);
+            }, 8000);
         });
     }
 
@@ -276,18 +276,20 @@ io.on('connection', (socket) => {
 });
 
 /* ===== serve UI ===== */
+app.get('/health', (req, res) => res.json({ ok: true, version: '1.1.0', uptime: process.uptime() }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>gefickt</title>
+<title>gefickt v1.1.0</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💀</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#09090b;color:#fafafa;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:16px;padding-bottom:180px;-webkit-tap-highlight-color:transparent}
-.app{width:100%;max-width:400px}
+.app{width:100%;max-width:400px;position:relative}
+.ver{position:fixed;top:10px;left:12px;font-size:10px;color:#3f3f46;font-family:monospace;letter-spacing:.03em}
 .logo{text-align:center;margin-bottom:28px}
 .logo h1{font-size:26px;font-weight:800;letter-spacing:-.5px}
 .logo h1 span{color:#a855f7}
@@ -330,6 +332,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
+<div class="ver">v1.1.0</div>
 <div class="app">
 <div class="logo"><h1>kahoot<span>.</span>gefickt</h1></div>
 <div class="field"><label>Game PIN</label><input type="text" id="pin" placeholder="4-10 digits" inputmode="numeric" maxlength="10"></div>
@@ -380,5 +383,10 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&goBtn.style.
 </html>`);
 });
 
+process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); process.exit(0); });
+process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); process.exit(0); });
+process.on('uncaughtException', (e) => { console.error('uncaughtException:', e.message); });
+process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); });
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('kahoot-gefickt on port ' + PORT));
+server.listen(PORT, () => console.log('kahoot-gefickt v1.1.0 on port ' + PORT));
