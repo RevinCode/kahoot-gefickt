@@ -50,14 +50,15 @@ loadProxies();
 /* ===== Socket.IO ===== */
 io.on('connection', (socket) => {
     console.log(`client: ${socket.id}`);
-    const state = { bots: [], running: false };
+    const state = { bots: [], running: false, autoAnswer: false };
 
     socket.on('start', async (data) => {
         if (state.running) return;
         state.running = true;
         state.bots = [];
 
-        const { pin, count, prefix, useProxy } = data;
+        const { pin, count, prefix, useProxy, autoAnswer } = data;
+        state.autoAnswer = !!autoAnswer;
         const total = Math.min(count || 10, 250);
         let succ = 0, fail = 0, proxyFails = 0;
 
@@ -97,10 +98,21 @@ io.on('connection', (socket) => {
                 });
 
                 client.on('QuestionStart', (question) => {
-                    socket.emit('question', {
-                        questionIndex: question.index,
-                        numChoices: question.choices ? question.choices.length : 4
-                    });
+                    const nc = question.choices ? question.choices.length : 4;
+                    socket.emit('question', { questionIndex: question.index, numChoices: nc });
+
+                    // auto-answer: random choice after random delay
+                    if (state.autoAnswer) {
+                        const choice = Math.floor(Math.random() * nc);
+                        const delay = Math.floor(Math.random() * 4000) + 1000;
+                        client._autoAnswered = false;
+                        setTimeout(() => {
+                            if (!client._autoAnswered && state.running) {
+                                client._autoAnswered = true;
+                                try { client.answer(choice, Math.floor(Math.random() * 2000) + 500); } catch (e) {}
+                            }
+                        }, delay);
+                    }
                 });
 
                 client.on('QuizStart', () => socket.emit('quizstart', {}));
@@ -242,6 +254,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <span class="toggle-label">use proxies</span>
 <span class="proxy-count" id="proxyCount">${proxyList.length} loaded</span>
 </div>
+<div class="toggle-row">
+<label class="toggle"><input type="checkbox" id="autoToggle" checked><span class="slider"></span></label>
+<span class="toggle-label">auto-answer (random)</span>
+</div>
 <button class="btn btn-go" id="goBtn">flood</button>
 <button class="btn btn-stop" id="stopBtn">stop</button>
 <div class="panel" id="panel">
@@ -264,12 +280,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <script src="/socket.io/socket.io.js"></script>
 <script>
 var socket=io();var succ=0,fail=0,total=0,connectedCount=0;
-var pinEl=document.getElementById('pin'),countEl=document.getElementById('count'),prefixEl=document.getElementById('prefix'),proxyEl=document.getElementById('proxyToggle'),goBtn=document.getElementById('goBtn'),stopBtn=document.getElementById('stopBtn'),panel=document.getElementById('panel'),logEl=document.getElementById('log'),botsEl=document.getElementById('bots'),countLabel=document.getElementById('countLabel'),barFill=document.getElementById('barFill'),abStatus=document.getElementById('abStatus'),abLast=document.getElementById('abLast');
+var pinEl=document.getElementById('pin'),countEl=document.getElementById('count'),prefixEl=document.getElementById('prefix'),proxyEl=document.getElementById('proxyToggle'),autoEl=document.getElementById('autoToggle'),goBtn=document.getElementById('goBtn'),stopBtn=document.getElementById('stopBtn'),panel=document.getElementById('panel'),logEl=document.getElementById('log'),botsEl=document.getElementById('bots'),countLabel=document.getElementById('countLabel'),barFill=document.getElementById('barFill'),abStatus=document.getElementById('abStatus'),abLast=document.getElementById('abLast');
 function addLog(t,c){var p=document.createElement('p');if(c)p.className=c;p.textContent=t;logEl.appendChild(p);logEl.scrollTop=logEl.scrollHeight}
 function updateUI(){var done=succ+fail;countLabel.textContent=done+' / '+total;barFill.style.width=Math.min(100,done/total*100)+'%'}
 function addTag(n,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=n;botsEl.appendChild(s)}
 function updateStatus(){if(connectedCount>0){abStatus.textContent=connectedCount+' bot'+(connectedCount>1?'s':'')+' ready';abStatus.className='status connected'}else{abStatus.textContent='not connected';abStatus.className='status'}}
-goBtn.addEventListener('click',function(){var pin=pinEl.value.trim().replace(/\\s/g,'');var count=parseInt(countEl.value)||10;var prefix=prefixEl.value.trim()||'Bot';if(!pin)return alert('enter a pin');succ=0;fail=0;total=count;connectedCount=0;goBtn.style.display='none';stopBtn.style.display='block';panel.style.display='block';logEl.innerHTML='';botsEl.innerHTML='';addLog('flood: '+pin+' / '+count+' bots','b');socket.emit('start',{pin:pin,count:count,prefix:prefix,useProxy:proxyEl.checked})});
+goBtn.addEventListener('click',function(){var pin=pinEl.value.trim().replace(/\\s/g,'');var count=parseInt(countEl.value)||10;var prefix=prefixEl.value.trim()||'Bot';if(!pin)return alert('enter a pin');succ=0;fail=0;total=count;connectedCount=0;goBtn.style.display='none';stopBtn.style.display='block';panel.style.display='block';logEl.innerHTML='';botsEl.innerHTML='';addLog('flood: '+pin+' / '+count+' bots','b');socket.emit('start',{pin:pin,count:count,prefix:prefix,useProxy:proxyEl.checked,autoAnswer:autoEl.checked})});
 stopBtn.addEventListener('click',function(){socket.emit('stop');goBtn.style.display='block';stopBtn.style.display='none';connectedCount=0;updateStatus();addLog('stopped','r')});
 function sendAns(choice){socket.emit('answer',{choice:choice});socket.emit('resetAnswers');var n=['RED','BLUE','YELLOW','GREEN'];abLast.textContent=n[choice]+' sent';addLog('sent: '+n[choice],'b');var btns=document.querySelectorAll('.abtn');btns.forEach(function(b,i){b.classList.toggle('sent',i===choice)});setTimeout(function(){btns.forEach(function(b){b.classList.remove('sent')})},400)}
 socket.on('log',function(t){addLog(t,'b')});
