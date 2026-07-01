@@ -7,8 +7,47 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
+/* ===== Proxy Management ===== */
+let proxyList = [];
+let proxyIndex = 0;
+
+function loadProxies() {
+    try {
+        proxyList = require('./proxies.json');
+        console.log(`Loaded ${proxyList.length} proxies`);
+    } catch (e) {
+        proxyList = [];
+        console.log('No proxies.json found, running without proxies');
+    }
+}
+
+function getNextProxy() {
+    if (proxyList.length === 0) return null;
+    const proxy = proxyList[proxyIndex % proxyList.length];
+    proxyIndex++;
+    return proxy;
+}
+
+function makeProxyAgent(proxyUrl) {
+    try {
+        if (proxyUrl.startsWith('socks')) {
+            const { SocksProxyAgent } = require('socks-proxy-agent');
+            return new SocksProxyAgent(proxyUrl);
+        } else {
+            const { HttpsProxyAgent } = require('https-proxy-agent');
+            return new HttpsProxyAgent(proxyUrl);
+        }
+    } catch (e) {
+        console.error(`proxy agent error: ${e.message}`);
+        return null;
+    }
+}
+
+loadProxies();
+
+/* ===== Socket.IO ===== */
 io.on('connection', (socket) => {
     console.log(`client: ${socket.id}`);
     const state = { bots: [], running: false };
@@ -18,24 +57,43 @@ io.on('connection', (socket) => {
         state.running = true;
         state.bots = [];
 
-        const { pin, count, prefix } = data;
+        const { pin, count, prefix, useProxy } = data;
         const total = Math.min(count || 10, 250);
-        let succ = 0, fail = 0;
+        let succ = 0, fail = 0, proxyFails = 0;
 
-        console.log(`\n=== FLOOD ${pin} / ${total} bots ===`);
-        socket.emit('log', `flood: ${pin} / ${total} bots`);
+        const proxyMode = useProxy && proxyList.length > 0;
+        console.log(`\n=== FLOOD ${pin} / ${total} bots ${proxyMode ? '(proxy mode)' : '(direct)'} ===`);
+        socket.emit('log', `flood: ${pin} / ${total} bots ${proxyMode ? '[proxy]' : '[direct]'}`);
 
         for (let i = 0; i < total && state.running; i++) {
             const name = `${prefix || 'Bot'}${i + 1}`;
-            try {
+            let currentProxy = proxyMode ? getNextProxy() : null;
+
+            const createBot = (proxy) => {
                 const client = new Kahoot();
                 client.loggingMode = false;
 
-                client.on('Joined', (settings) => {
+                if (proxy) {
+                    const agent = makeProxyAgent(proxy);
+                    if (agent) {
+                        client.defaults.proxy = (opts) => {
+                            opts.agent = agent;
+                            return opts;
+                        };
+                        client.defaults.wsproxy = (url) => {
+                            return { address: url, options: { agent } };
+                        };
+                    } else {
+                        console.log(`[${name}] bad proxy ${proxy}, going direct`);
+                        proxy = null;
+                    }
+                }
+
+                client.on('Joined', () => {
                     succ++;
                     state.bots.push({ client, name, answered: false });
-                    socket.emit('botJoin', { name, ok: true });
-                    console.log(`[${name}] joined`);
+                    socket.emit('botJoin', { name, ok: true, proxy: proxy || 'direct' });
+                    console.log(`[${name}] joined ${proxy ? '(' + proxy + ')' : '(direct)'}`);
                 });
 
                 client.on('QuestionStart', (question) => {
@@ -49,25 +107,29 @@ io.on('connection', (socket) => {
                 client.on('QuizEnd', () => socket.emit('gameover', {}));
                 client.on('GameStart', () => socket.emit('quizstart', {}));
                 client.on('GameEnd', () => socket.emit('gameover', {}));
-                client.on('Disconnect', () => {
-                    socket.emit('botDisconnect', { name });
-                });
+                client.on('Disconnect', () => socket.emit('botDisconnect', { name }));
 
                 client.join(pin, name).catch((e) => {
                     fail++;
-                    console.log(`[${name}] FAILED: ${e.message || e}`);
-                    socket.emit('botJoin', { name, ok: false, error: String(e.message || e) });
+                    const errMsg = String(e.message || e);
+                    console.log(`[${name}] FAILED: ${errMsg} ${proxy ? '(' + proxy + ')' : ''}`);
+                    socket.emit('botJoin', { name, ok: false, error: errMsg });
+
+                    // If proxy failed, retry with direct connection
+                    if (proxy) {
+                        proxyFails++;
+                        console.log(`[${name}] retrying without proxy...`);
+                        createBot(null);
+                    }
                 });
-            } catch (e) {
-                fail++;
-                console.log(`[${name}] ERROR: ${e.message}`);
-                socket.emit('botJoin', { name, ok: false, error: e.message });
-            }
+            };
+
+            createBot(currentProxy);
             await new Promise(r => setTimeout(r, 200));
         }
 
         setTimeout(() => {
-            console.log(`=== DONE: ${succ} ok, ${fail} failed ===`);
+            console.log(`=== DONE: ${succ} ok, ${fail} failed, ${proxyFails} proxy fails ===`);
             socket.emit('ready', { succ, fail });
             state.running = false;
         }, 8000);
@@ -77,9 +139,7 @@ io.on('connection', (socket) => {
         state.bots.forEach(b => {
             if (b.answered) return;
             b.answered = true;
-            try {
-                b.client.answer(data.choice, Math.floor(Math.random() * 2000) + 500);
-            } catch (e) {}
+            try { b.client.answer(data.choice, Math.floor(Math.random() * 2000) + 500); } catch (e) {}
         });
     });
 
@@ -100,7 +160,11 @@ io.on('connection', (socket) => {
     });
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, version: VERSION, uptime: process.uptime(), node: process.version }));
+app.get('/health', (req, res) => res.json({
+    ok: true, version: VERSION, uptime: process.uptime(),
+    node: process.version, proxies: proxyList.length
+}));
+
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -128,6 +192,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .btn-go{background:#a855f7;color:#fff}
 .btn-go:active{transform:scale(.98)}
 .btn-stop{background:#dc2626;color:#fff;display:none}
+.toggle-row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.toggle{position:relative;width:40px;height:22px;cursor:pointer}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;inset:0;background:#27272a;border-radius:11px;transition:.2s}
+.toggle .slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;bottom:3px;background:#71717a;border-radius:50%;transition:.2s}
+.toggle input:checked+.slider{background:#a855f7}
+.toggle input:checked+.slider:before{transform:translateX(18px);background:#fff}
+.toggle-label{font-size:12px;color:#a1a1aa}
+.proxy-count{font-size:10px;color:#3f3f46;margin-left:auto}
 .panel{margin-top:16px;background:#18181b;border:1px solid #27272a;border-radius:10px;overflow:hidden;display:none}
 .panel-head{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid #27272a}
 .panel-head span{font-size:11px;font-weight:600;color:#52525b;text-transform:uppercase}
@@ -164,6 +237,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="field"><label>Bots</label><input type="number" id="count" value="15" min="1" max="250" inputmode="numeric"></div>
 <div class="field"><label>Name</label><input type="text" id="prefix" value="Bot" maxlength="12"></div>
 </div>
+<div class="toggle-row">
+<label class="toggle"><input type="checkbox" id="proxyToggle"><span class="slider"></span></label>
+<span class="toggle-label">use proxies</span>
+<span class="proxy-count" id="proxyCount">${proxyList.length} loaded</span>
+</div>
 <button class="btn btn-go" id="goBtn">flood</button>
 <button class="btn btn-stop" id="stopBtn">stop</button>
 <div class="panel" id="panel">
@@ -186,16 +264,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <script src="/socket.io/socket.io.js"></script>
 <script>
 var socket=io();var succ=0,fail=0,total=0,connectedCount=0;
-var pinEl=document.getElementById('pin'),countEl=document.getElementById('count'),prefixEl=document.getElementById('prefix'),goBtn=document.getElementById('goBtn'),stopBtn=document.getElementById('stopBtn'),panel=document.getElementById('panel'),logEl=document.getElementById('log'),botsEl=document.getElementById('bots'),countLabel=document.getElementById('countLabel'),barFill=document.getElementById('barFill'),abStatus=document.getElementById('abStatus'),abLast=document.getElementById('abLast');
+var pinEl=document.getElementById('pin'),countEl=document.getElementById('count'),prefixEl=document.getElementById('prefix'),proxyEl=document.getElementById('proxyToggle'),goBtn=document.getElementById('goBtn'),stopBtn=document.getElementById('stopBtn'),panel=document.getElementById('panel'),logEl=document.getElementById('log'),botsEl=document.getElementById('bots'),countLabel=document.getElementById('countLabel'),barFill=document.getElementById('barFill'),abStatus=document.getElementById('abStatus'),abLast=document.getElementById('abLast');
 function addLog(t,c){var p=document.createElement('p');if(c)p.className=c;p.textContent=t;logEl.appendChild(p);logEl.scrollTop=logEl.scrollHeight}
 function updateUI(){var done=succ+fail;countLabel.textContent=done+' / '+total;barFill.style.width=Math.min(100,done/total*100)+'%'}
 function addTag(n,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=n;botsEl.appendChild(s)}
 function updateStatus(){if(connectedCount>0){abStatus.textContent=connectedCount+' bot'+(connectedCount>1?'s':'')+' ready';abStatus.className='status connected'}else{abStatus.textContent='not connected';abStatus.className='status'}}
-goBtn.addEventListener('click',function(){var pin=pinEl.value.trim().replace(/\\s/g,'');var count=parseInt(countEl.value)||10;var prefix=prefixEl.value.trim()||'Bot';if(!pin)return alert('enter a pin');succ=0;fail=0;total=count;connectedCount=0;goBtn.style.display='none';stopBtn.style.display='block';panel.style.display='block';logEl.innerHTML='';botsEl.innerHTML='';addLog('flood: '+pin+' / '+count+' bots','b');socket.emit('start',{pin:pin,count:count,prefix:prefix})});
+goBtn.addEventListener('click',function(){var pin=pinEl.value.trim().replace(/\\s/g,'');var count=parseInt(countEl.value)||10;var prefix=prefixEl.value.trim()||'Bot';if(!pin)return alert('enter a pin');succ=0;fail=0;total=count;connectedCount=0;goBtn.style.display='none';stopBtn.style.display='block';panel.style.display='block';logEl.innerHTML='';botsEl.innerHTML='';addLog('flood: '+pin+' / '+count+' bots','b');socket.emit('start',{pin:pin,count:count,prefix:prefix,useProxy:proxyEl.checked})});
 stopBtn.addEventListener('click',function(){socket.emit('stop');goBtn.style.display='block';stopBtn.style.display='none';connectedCount=0;updateStatus();addLog('stopped','r')});
 function sendAns(choice){socket.emit('answer',{choice:choice});socket.emit('resetAnswers');var n=['RED','BLUE','YELLOW','GREEN'];abLast.textContent=n[choice]+' sent';addLog('sent: '+n[choice],'b');var btns=document.querySelectorAll('.abtn');btns.forEach(function(b,i){b.classList.toggle('sent',i===choice)});setTimeout(function(){btns.forEach(function(b){b.classList.remove('sent')})},400)}
 socket.on('log',function(t){addLog(t,'b')});
-socket.on('botJoin',function(d){if(d.ok){succ++;connectedCount++;addLog('+ '+d.name,'g');addTag(d.name,'g');updateStatus()}else{fail++;addLog('x '+d.name+': '+d.error,'r');addTag(d.name,'r')}updateUI()});
+socket.on('botJoin',function(d){if(d.ok){succ++;connectedCount++;addLog('+ '+d.name+(d.proxy?' ['+d.proxy+']':''),'g');addTag(d.name,'g');updateStatus()}else{fail++;addLog('x '+d.name+': '+d.error,'r');addTag(d.name,'r')}updateUI()});
 socket.on('ready',function(d){addLog('done: '+d.succ+' connected, '+d.fail+' failed',d.succ>0?'g':'r')});
 socket.on('question',function(d){addLog('question ('+d.numChoices+' choices)','y')});
 socket.on('quizstart',function(){addLog('quiz started','b')});
@@ -212,4 +290,4 @@ process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`kahoot-gefickt ${VERSION} on port ${PORT}`));
+server.listen(PORT, () => console.log(`kahoot-gefickt ${VERSION} on port ${PORT} (${proxyList.length} proxies)`));
