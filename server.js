@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const VERSION = '1.6.0';
+const VERSION = '2.0.0';
 
 /* ===== Proxy Management ===== */
 let proxyList = [];
@@ -95,6 +95,12 @@ io.on('connection', (socket) => {
                     state.bots.push({ client, name, answered: false });
                     socket.emit('botJoin', { name, ok: true, proxy: proxy || 'direct' });
                     console.log(`[${name}] joined ${proxy ? '(' + proxy + ')' : '(direct)'}`);
+                });
+
+                client.on('QuestionReady', (question) => {
+                    // Reset answered flag for new question
+                    const bot = state.bots.find(b => b.client === client);
+                    if (bot) bot.answered = false;
                 });
 
                 client.on('QuestionStart', (question) => {
