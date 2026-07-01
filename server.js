@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 /* ===== Proxy Management ===== */
 let proxyList = [];
@@ -98,18 +98,42 @@ io.on('connection', (socket) => {
                 });
 
                 client.on('QuestionStart', (question) => {
-                    const nc = question.choices ? question.choices.length : 4;
-                    socket.emit('question', { questionIndex: question.index, numChoices: nc });
+                    const qIdx = question.questionIndex || 0;
+                    const nc = (question.quizQuestionAnswers && question.quizQuestionAnswers[qIdx]) || 4;
+                    const qType = question.gameBlockType || 'quiz';
+                    socket.emit('question', { questionIndex: qIdx, numChoices: nc, type: qType });
 
-                    // auto-answer: random choice after random delay
                     if (state.autoAnswer) {
-                        const choice = Math.floor(Math.random() * nc);
+                        let choice;
+                        switch (qType) {
+                            case 'multiple_select_quiz':
+                            case 'multiple_select_poll':
+                                // pick 1-3 random answers
+                                { const picks = Math.floor(Math.random() * Math.min(3, nc)) + 1;
+                                const all = Array.from({length: nc}, (_, i) => i);
+                                for (let x = all.length - 1; x > 0; x--) { const y = Math.floor(Math.random() * (x + 1)); [all[x], all[y]] = [all[y], all[x]]; }
+                                choice = all.slice(0, picks); }
+                                break;
+                            case 'jumble':
+                                choice = [0, 1, 2, 3];
+                                break;
+                            case 'word_cloud':
+                            case 'open_ended':
+                                // library handles text type internally
+                                choice = Math.floor(Math.random() * nc);
+                                break;
+                            default:
+                                choice = Math.floor(Math.random() * nc);
+                        }
                         const delay = Math.floor(Math.random() * 4000) + 1000;
                         client._autoAnswered = false;
                         setTimeout(() => {
                             if (!client._autoAnswered && state.running) {
                                 client._autoAnswered = true;
-                                try { client.answer(choice, Math.floor(Math.random() * 2000) + 500); } catch (e) {}
+                                console.log(`[${name}] auto-answering q${qIdx} type=${qType} choice=${JSON.stringify(choice)}`);
+                                try { client.answer(choice, Math.floor(Math.random() * 2000) + 500); } catch (e) {
+                                    console.log(`[${name}] auto-answer error: ${e.message || e}`);
+                                }
                             }
                         }, delay);
                     }
@@ -291,7 +315,7 @@ function sendAns(choice){socket.emit('answer',{choice:choice});socket.emit('rese
 socket.on('log',function(t){addLog(t,'b')});
 socket.on('botJoin',function(d){if(d.ok){succ++;connectedCount++;addLog('+ '+d.name+(d.proxy?' ['+d.proxy+']':''),'g');addTag(d.name,'g');updateStatus()}else{fail++;addLog('x '+d.name+': '+d.error,'r');addTag(d.name,'r')}updateUI()});
 socket.on('ready',function(d){addLog('done: '+d.succ+' connected, '+d.fail+' failed',d.succ>0?'g':'r')});
-socket.on('question',function(d){addLog('question ('+d.numChoices+' choices)','y')});
+socket.on('question',function(d){addLog('question #'+d.questionIndex+' ('+d.numChoices+' choices, '+d.type+')','y')});
 socket.on('quizstart',function(){addLog('quiz started','b')});
 socket.on('gameover',function(){addLog('game over','b')});
 socket.on('botDisconnect',function(d){connectedCount--;updateStatus();addLog('- '+d.name+' disconnected','r')});
