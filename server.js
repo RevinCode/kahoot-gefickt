@@ -1,247 +1,22 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const WebSocket = require('ws');
+const Kahoot = require('kahoot.js-latest');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36';
-
-function solveChallenge(sessionTokenB64, challengeText) {
-    const text = challengeText.replace(/[^\x20-\x7E]/g, '');
-    const stringMatch = text.match(/'([^']+)'/);
-    if (!stringMatch) throw new Error('Could not extract encoded string');
-    const encoded = stringMatch[1];
-    const offsetMatch = text.match(/var offset\s*=\s*(.+?);/);
-    if (!offsetMatch) throw new Error('Could not extract offset');
-    const offsetExpr = offsetMatch[1].replace(/[^0-9+\-*/() ]/g, '').trim();
-    const offset = Function('"use strict"; return (' + offsetExpr + ')')();
-    const modMatch = text.match(/%\s*(\d+)\)/);
-    const addMatch = text.match(/%\s*\d+\)\s*\+\s*(\d+)\)/);
-    if (!modMatch || !addMatch) throw new Error('Could not extract mod/add');
-    const mod = parseInt(modMatch[1]);
-    const add = parseInt(addMatch[1]);
-    let decoded = '';
-    for (let i = 0; i < encoded.length; i++) {
-        decoded += String.fromCharCode(((encoded.charCodeAt(i) * i + offset) % mod) + add);
-    }
-    const decodedToken = Buffer.from(sessionTokenB64, 'base64');
-    const sol = [...decoded].map(c => c.charCodeAt(0));
-    let result = '';
-    for (let i = 0; i < decodedToken.length; i++) {
-        result += String.fromCharCode(decodedToken[i] ^ sol[i % sol.length]);
-    }
-    return result;
-}
-
-async function getSessionToken(pin) {
-    const ts = Date.now();
-    const resp = await fetch(`https://kahoot.it/reserve/session/${pin}/?${ts}`, {
-        headers: { 'User-Agent': UA }
-    });
-    if (resp.status === 404) throw new Error('Game not found (404)');
-    const body = await resp.json();
-    if (!body.challenge) throw new Error('No challenge in response');
-    const token = resp.headers.get('x-kahoot-session-token');
-    if (!token) throw new Error('No session token header');
-    return { token, challenge: body.challenge };
-}
-
-class KahootBot {
-    constructor(pin, name, onEvent) {
-        this.pin = String(pin);
-        this.name = name;
-        this.onEvent = onEvent;
-        this.ws = null;
-        this.cid = null;
-        this.mid = 0;
-        this.ok = false;
-        this.answered = false;
-        this.questionIndex = 0;
-        this.closed = false;
-        this.log = (msg) => console.log(`[${this.name}] ${msg}`);
-    }
-
-    async connect() {
-        this.log('getting session token...');
-        const { token, challenge } = await getSessionToken(this.pin);
-        this.log('solving challenge...');
-        const sessionToken = solveChallenge(token, challenge);
-        this.log('token: ' + sessionToken.substring(0, 30) + '...');
-        return this._connectWs(sessionToken);
-    }
-
-    _connectWs(sessionToken) {
-        return new Promise((resolve, reject) => {
-            const url = `wss://kahoot.it/cometd/${this.pin}/${sessionToken}`;
-            this.log('connecting: ' + url.substring(0, 60) + '...');
-            try {
-                this.ws = new WebSocket(url);
-            } catch (e) {
-                this.log('WS CREATE ERROR: ' + e.message);
-                return reject(new Error('ws create: ' + e.message));
-            }
-            const timer = setTimeout(() => {
-                if (!this.ok) {
-                    this.log('TIMEOUT');
-                    this._closeWs();
-                    reject(new Error('timeout'));
-                }
-            }, 8000);
-            this.ws.on('open', () => {
-                this.log('ws open');
-                this._handshake();
-            });
-            this.ws.on('message', (data) => {
-                try {
-                    const msgs = JSON.parse(data.toString());
-                    const arr = Array.isArray(msgs) ? msgs : [msgs];
-                    arr.forEach(m => this._onMsg(m, resolve, timer));
-                } catch (e) {
-                    this.log('parse error: ' + e.message);
-                }
-            });
-            this.ws.on('error', (e) => {
-                this.log('ws error: ' + e.message);
-                clearTimeout(timer);
-                reject(new Error('ws:' + e.message));
-            });
-            this.ws.on('close', (code, reason) => {
-                this.log('ws closed: ' + code);
-                if (this.ok) this.onEvent('disconnect', {});
-                this.ok = false;
-            });
-        });
-    }
-
-    _handshake() {
-        this._send({
-            channel: '/meta/handshake',
-            version: '1.0',
-            minimumVersion: '1.0',
-            supportedConnectionTypes: ['websocket', 'long-polling'],
-            advice: { timeout: 60000, interval: 0 },
-            ext: { ack: true, timesync: { tc: Date.now(), l: 0, o: 0 } }
-        });
-    }
-
-    _onMsg(m, resolve, timer) {
-        const ch = m.channel || '';
-
-        if (ch === '/meta/handshake') {
-            this.cid = m.clientId;
-            this.log('handshake ok, cid=' + (this.cid || 'NONE').substring(0, 20));
-            if (!this.cid) return;
-            for (const svc of ['controller', 'player', 'status']) {
-                this._send({ channel: '/meta/subscribe', subscription: `/service/${svc}` });
-            }
-            this._send({ channel: '/meta/connect', connectionType: 'websocket', advice: { timeout: 0 } });
-            return;
-        }
-
-        if (ch === '/meta/subscribe') {
-            this.log('sub ' + m.subscription + ': ' + (m.successful ? 'ok' : 'FAIL'));
-            return;
-        }
-
-        if (ch === '/meta/connect') return;
-
-        if (ch === '/service/player') {
-            const data = m.data || {};
-            const id = data.id;
-            let content = {};
-            try { content = JSON.parse(data.content || '{}'); } catch (e) {}
-            this.log('player id=' + id + ' content=' + JSON.stringify(content).substring(0, 100));
-
-            if (id === 14) {
-                this.log('>>> JOINED GAME <<<');
-                this.ok = true;
-                clearTimeout(timer);
-                this.onEvent('joined', {});
-                if (resolve) resolve();
-            }
-
-            if (id === 2) {
-                this.answered = false;
-                this.questionIndex = content.questionIndex || 0;
-                let nc = 4;
-                if (content.quizQuestionAnswers && content.quizQuestionAnswers[0]) nc = content.quizQuestionAnswers[0];
-                this.onEvent('question', { numChoices: nc, questionIndex: this.questionIndex });
-            }
-            if (id === 9) this.onEvent('quizstart', content);
-            if (id === 3) this.onEvent('gameover', content);
-        }
-
-        if (ch === '/service/controller') {
-            this.log('controller: ' + JSON.stringify(m).substring(0, 200));
-        }
-    }
-
-    join() {
-        this.log('sending join...');
-        this._send({
-            channel: '/service/controller',
-            data: {
-                id: 16,
-                type: 'message',
-                gameid: parseInt(this.pin),
-                host: 'kahoot.it',
-                content: JSON.stringify({
-                    name: this.name,
-                    gameMode: 'classic',
-                    policy: 'chat'
-                })
-            }
-        });
-    }
-
-    sendAnswer(choice) {
-        if (this.answered || !this.ok || this.closed) return;
-        this.answered = true;
-        this._send({
-            channel: '/service/controller',
-            data: {
-                id: 6,
-                type: 'message',
-                gameid: parseInt(this.pin),
-                host: 'kahoot.it',
-                content: JSON.stringify({
-                    choice,
-                    meta: {
-                        lag: Math.floor(Math.random() * 200) + 50,
-                        device: { userAgent: UA, screen: { width: 1920, height: 1080 } }
-                    }
-                })
-            }
-        });
-    }
-
-    _send(msg) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this.mid++;
-        msg.id = String(this.mid);
-        if (msg.channel !== '/meta/handshake') msg.clientId = this.cid;
-        this.ws.send(JSON.stringify([msg]));
-    }
-
-    _closeWs() { try { if (this.ws) this.ws.close(); } catch (e) {} }
-    close() { this.closed = true; this.ok = false; this._closeWs(); }
-}
-
-/* ===== Socket.IO ===== */
-const sessions = {};
+const VERSION = '1.4.0';
 
 io.on('connection', (socket) => {
     console.log(`client: ${socket.id}`);
-    sessions[socket.id] = { bots: [], running: false };
+    const state = { bots: [], running: false };
 
     socket.on('start', async (data) => {
-        const session = sessions[socket.id];
-        if (!session || session.running) return;
-        session.running = true;
-        session.bots = [];
+        if (state.running) return;
+        state.running = true;
+        state.bots = [];
 
         const { pin, count, prefix } = data;
         const total = Math.min(count || 10, 250);
@@ -250,65 +25,89 @@ io.on('connection', (socket) => {
         console.log(`\n=== FLOOD ${pin} / ${total} bots ===`);
         socket.emit('log', `flood: ${pin} / ${total} bots`);
 
-        for (let i = 0; i < total && session.running; i++) {
+        for (let i = 0; i < total && state.running; i++) {
             const name = `${prefix || 'Bot'}${i + 1}`;
-            const bot = new KahootBot(pin, name, (ev, d) => {
-                if (ev === 'joined') {
+            try {
+                const client = new Kahoot();
+                client.loggingMode = false;
+
+                client.on('Joined', (settings) => {
                     succ++;
-                    session.bots.push(bot);
+                    state.bots.push({ client, name, answered: false });
                     socket.emit('botJoin', { name, ok: true });
-                }
-                if (ev === 'question') socket.emit('question', d);
-                if (ev === 'quizstart') socket.emit('quizstart', d);
-                if (ev === 'gameover') socket.emit('gameover', d);
-                if (ev === 'disconnect') socket.emit('botDisconnect', { name });
-            });
-            bot.connect().then(() => {
-                bot.join();
-            }).catch((e) => {
+                    console.log(`[${name}] joined`);
+                });
+
+                client.on('QuestionStart', (question) => {
+                    socket.emit('question', {
+                        questionIndex: question.index,
+                        numChoices: question.choices ? question.choices.length : 4
+                    });
+                });
+
+                client.on('QuizStart', () => socket.emit('quizstart', {}));
+                client.on('QuizEnd', () => socket.emit('gameover', {}));
+                client.on('GameStart', () => socket.emit('quizstart', {}));
+                client.on('GameEnd', () => socket.emit('gameover', {}));
+                client.on('Disconnect', () => {
+                    socket.emit('botDisconnect', { name });
+                });
+
+                client.join(pin, name).catch((e) => {
+                    fail++;
+                    console.log(`[${name}] FAILED: ${e.message || e}`);
+                    socket.emit('botJoin', { name, ok: false, error: String(e.message || e) });
+                });
+            } catch (e) {
                 fail++;
-                console.log(`[${name}] FAILED: ${e.message}`);
+                console.log(`[${name}] ERROR: ${e.message}`);
                 socket.emit('botJoin', { name, ok: false, error: e.message });
-                bot.close();
-            });
-            await new Promise(r => setTimeout(r, 300));
+            }
+            await new Promise(r => setTimeout(r, 200));
         }
 
-        await new Promise(r => setTimeout(r, 10000));
-        console.log(`=== DONE: ${succ} ok, ${fail} failed ===\n`);
-        socket.emit('ready', { succ, fail });
-        session.running = false;
+        setTimeout(() => {
+            console.log(`=== DONE: ${succ} ok, ${fail} failed ===`);
+            socket.emit('ready', { succ, fail });
+            state.running = false;
+        }, 8000);
     });
 
     socket.on('answer', (data) => {
-        const session = sessions[socket.id];
-        if (!session) return;
-        session.bots.forEach(b => { b.answered = false; b.sendAnswer(data.choice); });
+        state.bots.forEach(b => {
+            if (b.answered) return;
+            b.answered = true;
+            try {
+                b.client.answer(data.choice, Math.floor(Math.random() * 2000) + 500);
+            } catch (e) {}
+        });
+    });
+
+    socket.on('resetAnswers', () => {
+        state.bots.forEach(b => b.answered = false);
     });
 
     socket.on('stop', () => {
-        const session = sessions[socket.id];
-        if (!session) return;
-        session.running = false;
-        session.bots.forEach(b => b.close());
-        session.bots = [];
+        state.running = false;
+        state.bots.forEach(b => { try { b.client.leave(); } catch (e) {} });
+        state.bots = [];
     });
 
     socket.on('disconnect', () => {
-        const session = sessions[socket.id];
-        if (session) { session.running = false; session.bots.forEach(b => b.close()); delete sessions[socket.id]; }
+        state.running = false;
+        state.bots.forEach(b => { try { b.client.leave(); } catch (e) {} });
+        state.bots = [];
     });
 });
 
-/* ===== serve UI ===== */
-app.get('/health', (req, res) => res.json({ ok: true, version: '1.3.1', uptime: process.uptime() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: VERSION, uptime: process.uptime(), node: process.version }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>gefickt v1.3.1</title>
+<title>gefickt ${VERSION}</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💀</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -357,7 +156,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
-<div class="ver">v1.3.1</div>
+<div class="ver">v${VERSION}</div>
 <div class="app">
 <div class="logo"><h1>kahoot<span>.</span>gefickt</h1></div>
 <div class="field"><label>Game PIN</label><input type="text" id="pin" placeholder="4-10 digits" inputmode="numeric" maxlength="10"></div>
@@ -394,7 +193,7 @@ function addTag(n,c){var s=document.createElement('span');if(c)s.className=c;s.t
 function updateStatus(){if(connectedCount>0){abStatus.textContent=connectedCount+' bot'+(connectedCount>1?'s':'')+' ready';abStatus.className='status connected'}else{abStatus.textContent='not connected';abStatus.className='status'}}
 goBtn.addEventListener('click',function(){var pin=pinEl.value.trim().replace(/\\s/g,'');var count=parseInt(countEl.value)||10;var prefix=prefixEl.value.trim()||'Bot';if(!pin)return alert('enter a pin');succ=0;fail=0;total=count;connectedCount=0;goBtn.style.display='none';stopBtn.style.display='block';panel.style.display='block';logEl.innerHTML='';botsEl.innerHTML='';addLog('flood: '+pin+' / '+count+' bots','b');socket.emit('start',{pin:pin,count:count,prefix:prefix})});
 stopBtn.addEventListener('click',function(){socket.emit('stop');goBtn.style.display='block';stopBtn.style.display='none';connectedCount=0;updateStatus();addLog('stopped','r')});
-function sendAns(choice){socket.emit('answer',{choice:choice});var n=['RED','BLUE','YELLOW','GREEN'];abLast.textContent=n[choice]+' sent';addLog('sent: '+n[choice],'b');var btns=document.querySelectorAll('.abtn');btns.forEach(function(b,i){b.classList.toggle('sent',i===choice)});setTimeout(function(){btns.forEach(function(b){b.classList.remove('sent')})},400)}
+function sendAns(choice){socket.emit('answer',{choice:choice});socket.emit('resetAnswers');var n=['RED','BLUE','YELLOW','GREEN'];abLast.textContent=n[choice]+' sent';addLog('sent: '+n[choice],'b');var btns=document.querySelectorAll('.abtn');btns.forEach(function(b,i){b.classList.toggle('sent',i===choice)});setTimeout(function(){btns.forEach(function(b){b.classList.remove('sent')})},400)}
 socket.on('log',function(t){addLog(t,'b')});
 socket.on('botJoin',function(d){if(d.ok){succ++;connectedCount++;addLog('+ '+d.name,'g');addTag(d.name,'g');updateStatus()}else{fail++;addLog('x '+d.name+': '+d.error,'r');addTag(d.name,'r')}updateUI()});
 socket.on('ready',function(d){addLog('done: '+d.succ+' connected, '+d.fail+' failed',d.succ>0?'g':'r')});
@@ -409,10 +208,8 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&goBtn.style.
 </html>`);
 });
 
-process.on('SIGTERM', () => { process.exit(0); });
-process.on('SIGINT', () => { process.exit(0); });
-process.on('uncaughtException', (e) => { console.error('uncaughtException:', e.message); });
-process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); });
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('kahoot-gefickt v1.3.1 on port ' + PORT));
+server.listen(PORT, () => console.log(`kahoot-gefickt ${VERSION} on port ${PORT}`));
